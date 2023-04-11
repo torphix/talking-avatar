@@ -221,7 +221,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/home/j/Desktop/Programming/DeepLearning/multilingual/avatar/data/vox",
+        default="./data/vox",
         help="Path to data directory",
     )
     parser.add_argument(
