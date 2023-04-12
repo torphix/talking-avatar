@@ -2,11 +2,13 @@ import argparse
 import logging
 import math
 import os
+import torch.nn as nn
 import random
 from pathlib import Path
 from data import AudioVideoFrameDataset
 import accelerate
 import datasets
+import torchvision
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -20,8 +22,7 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
-
+import json
 import diffusers
 from diffusers import (
     AutoencoderKL,
@@ -39,70 +40,88 @@ if is_wandb_available():
     import wandb
 
 
+os.environ['LD_LIBRARY_PATH'] = "/usr/lib/x86_64-linux-gnu"
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.15.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
-DATASET_NAME_MAPPING = {
-    "lambdalabs/pokemon-blip-captions": ("image", "text"),
-}
-
-
 def log_validation(
-    vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch
+    vae,unet,noise_scheduler, datapoint_paths, image_transforms, args, accelerator, weight_dtype, epoch
 ):
     logger.info("Running validation... ")
-
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=accelerator.unwrap_model(unet),
-        safety_checker=None,
-        revision=args.revision,
-        torch_dtype=weight_dtype,
-    )
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    images = []
-    for i in range(len(args.validation_prompts)):
-        with torch.autocast("cuda"):
-            image = pipeline(
-                args.validation_prompts[i], num_inference_steps=20, generator=generator
-            ).images[0]
-
-        images.append(image)
-
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(
-                "validation", np_images, epoch, dataformats="NHWC"
+    with torch.no_grad():
+        for datapoint in datapoint_paths:
+            # Prepare datapoint
+            with open(datapoint, 'r') as f:
+                data = json.load(f)
+            audio_frame = torch.from_numpy(np.load(data["audio_frame"])).to(accelerator.device).unsqueeze(0)
+            video_frame = torch.from_numpy(np.load(data["video_frame"]))
+            # Randomly select a frame from the video frames directory
+            dir_path = "/".join(data["video_frame"].split("/")[:-1])
+            id_frame = f'{dir_path}/{random.choice(os.listdir(dir_path))}'
+            id_frame = torch.from_numpy(np.load(id_frame))
+            # Get motion frames
+            if data["motion_frame"]:
+                motion_frames = [
+                    torch.from_numpy(np.load(frame)) for frame in data["motion_frame"]
+                ]
+            else:
+                motion_frames = [id_frame, id_frame]
+            # Apply transforms
+            if image_transforms:
+                video_frame = image_transforms(video_frame/255).to(accelerator.device).to(weight_dtype).unsqueeze(0)
+                id_frame = image_transforms(id_frame/255).to(accelerator.device).to(weight_dtype).unsqueeze(0)
+                motion_frames = [image_transforms(frame/255).to(accelerator.device).to(weight_dtype).unsqueeze(0) for frame in motion_frames]
+            # Prepare for input
+            video_latent = vae.encode(video_frame.to(weight_dtype)).latent_dist.sample()
+            video_latent = video_latent * vae.config.scaling_factor
+            # Encode id image
+            id_latents = vae.encode(
+                id_frame.to(weight_dtype)
+            ).latent_dist.sample()
+            id_latents = id_latents * vae.config.scaling_factor
+            # Encode motion images
+            motion_latents = torch.cat(
+                [
+                    vae.encode(l.to(weight_dtype)).latent_dist.sample()
+                    for l in motion_frames
+                ],
+                1,
             )
-        elif tracker.name == "wandb":
-            tracker.log(
-                {
-                    "validation": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
-                        for i, image in enumerate(images)
-                    ]
-                }
-            )
-        else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+            motion_latents = motion_latents * vae.config.scaling_factor
+            # Sample noise that we'll add to the latents
+            noise = torch.randn_like(video_latent)
+            timesteps = torch.tensor([50]).long().to(accelerator.device)
 
-    del pipeline
+            # Add noise to the latents according to the noise magnitude at each timestep
+            # (this is the forward diffusion process)
+            noisy_latents = noise_scheduler.add_noise(video_latent, noise, timesteps)
+            # Get the text embedding for conditioning
+            encoder_hidden_states = audio_frame.to(weight_dtype)
+            for t in range(timesteps):
+                # Add the identity frame to the noisy latents
+                inputs = torch.cat(
+                    [
+                        noisy_latents,
+                        id_latents,
+                        motion_latents,
+                    ],
+                    dim=1,
+                )
+                # Input into model
+                noise_pred = unet(
+                        inputs, timesteps, encoder_hidden_states
+                ).sample
+                noisy_latents = noise_scheduler.step(noise_pred, t, noisy_latents).prev_sample.to(weight_dtype)
+        # Decode the latents
+        noisy_latents = 1 / vae.config.scaling_factor * noisy_latents
+        image = vae.decode(noisy_latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        image = image.cpu().float()
+        # Save the image
+        torchvision.utils.save_image(image, f'results/{epoch}_image.png')
     torch.cuda.empty_cache()
 
 
@@ -111,7 +130,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
+        default="runwayml/stable-diffusion-v1-5",
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
@@ -122,44 +141,7 @@ def parse_args():
         required=False,
         help="Revision of pretrained model identifier from huggingface.co/models.",
     )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that 🤗 Datasets can understand."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
-        "--image_column",
-        type=str,
-        default="image",
-        help="The column of the dataset containing an image.",
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default="text",
-        help="The column of the dataset containing a caption or a list of captions.",
-    )
+
     parser.add_argument(
         "--max_train_samples",
         type=int,
@@ -169,15 +151,7 @@ def parse_args():
             "value if set."
         ),
     )
-    parser.add_argument(
-        "--validation_prompts",
-        type=str,
-        default=None,
-        nargs="+",
-        help=(
-            "A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."
-        ),
-    )
+
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -196,7 +170,7 @@ def parse_args():
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=256,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -219,7 +193,7 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=16,
+        default=1,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
@@ -232,7 +206,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=32,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
@@ -387,7 +361,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=5000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -435,15 +409,22 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
-
+    parser.add_argument(
+        "--check_val_every_n_steps",
+        type=int,
+        default=10,
+        help="Run validation every X epochs.",
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="The path to the data directory.",
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
@@ -514,16 +495,8 @@ def main():
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        revision=args.revision,
-    )
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=args.revision,
-    )
+
+
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
     )
@@ -535,7 +508,6 @@ def main():
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -677,14 +649,11 @@ def main():
             transforms.RandomHorizontalFlip()
             if args.random_flip
             else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )
     # Load Data
-    train_dataset = AudioVideoFrameDataset(
-        "./data/identity", "./data/video", "./data/audio", train_transforms
-    )
+    train_dataset = AudioVideoFrameDataset(args.data_dir, train_transforms)
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -714,6 +683,15 @@ def main():
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_dataloader, lr_scheduler
     )
+    # Override unet in layer
+    unet.conv_in = nn.Conv2d(
+        16,
+        unet.conv_in.out_channels,
+        kernel_size=unet.conv_in.kernel_size,
+        padding=unet.conv_in.padding,
+        dtype=unet.conv_in.weight.dtype,
+    )
+    unet.encoder_hid_proj = nn.Linear(1024, 768)
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
@@ -727,8 +705,8 @@ def main():
         weight_dtype = torch.bfloat16
 
     # Move text_encode and vae to gpu and cast to weight_dtype
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
+    unet.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -743,7 +721,6 @@ def main():
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
-        tracker_config.pop("validation_prompts")
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
     # Train!
@@ -798,7 +775,7 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description("Steps")
-
+    last_step_check = 0
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
@@ -819,7 +796,20 @@ def main():
                     batch["target_frame"].to(weight_dtype)
                 ).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
-
+                # Encode id image
+                id_latents = vae.encode(
+                    batch["id_frame"].to(weight_dtype)
+                ).latent_dist.sample()
+                id_latents = id_latents * vae.config.scaling_factor
+                # Encode motion images
+                motion_latents = torch.cat(
+                    [
+                        vae.encode(l.to(weight_dtype)).latent_dist.sample()
+                        for l in batch["motion_frames"]
+                    ],
+                    1,
+                )
+                motion_latents = motion_latents * vae.config.scaling_factor
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 if args.noise_offset:
@@ -846,12 +836,11 @@ def main():
                 noisy_latents = torch.cat(
                     [
                         noisy_latents,
-                        batch["id_frame"].to(weight_dtype),
-                        batch["motion_frame"].to(weight_dtype),
+                        id_latents,
+                        motion_latents,
                     ],
                     dim=1,
                 )
-
                 # Get the text embedding for conditioning
                 encoder_hidden_states = batch["audio_frame"].to(weight_dtype)
 
@@ -864,7 +853,6 @@ def main():
                     raise ValueError(
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
-
                 # Predict the noise residual and compute loss
                 model_pred = unet(
                     noisy_latents, timesteps, encoder_hidden_states
@@ -934,21 +922,25 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
-
-        if accelerator.is_main_process:
+        # if accelerator.is_main_process:
             if (
-                args.validation_prompts is not None
-                and epoch % args.validation_epochs == 0
+                global_step % args.check_val_every_n_steps == 0 and global_step != 0
             ):
+                if global_step == last_step_check:
+                    continue
+                else:
+                    last_step_check = global_step
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
+                print('Running validation')
                 log_validation(
                     vae,
-                    text_encoder,
-                    tokenizer,
                     unet,
+                    noise_scheduler,
+                    ['/home/ubuntu/data/vox/processed/datapoints/id06209/6oI-FJQS9V0/00027/00027_0.json'],
+                    train_transforms,
                     args,
                     accelerator,
                     weight_dtype,

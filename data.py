@@ -12,12 +12,12 @@ from moviepy.editor import VideoFileClip, AudioFileClip
 
 
 class Preprocessor:
-    def __init__(self, data_dir: str, audio_sr: int, video_fps: int):
+    def __init__(self, data_dir: str, output_dir:str,audio_sr: int, video_fps: int):
         self.audio_sr = audio_sr
         self.video_fps = video_fps
         self.video_dir = os.path.join(data_dir, "video")
         self.audio_dir = os.path.join(data_dir, "audio")
-        self.output_data_dir = os.path.join(data_dir, "processed")
+        self.output_data_dir = os.path.join(output_dir, "processed")
         # Audio feature extractor
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         # self.device = "cpu"
@@ -88,24 +88,23 @@ class Preprocessor:
                         sr=self.audio_sr,
                         mono=True,
                     )
-                    # Get audio frames
-                    audio_frames = self.get_audio_frames(audio)
+
                     # Get video frames
                     video_frames = video.iter_frames()
                     # Crop video frames to match audio frames
-                    video_frames = [frame for frame in video_frames][
-                        : len(audio_frames)
-                    ]
+                    video_frames = [frame for frame in video_frames]
+                    # Get audio frames
+                    audio_frames = self.get_audio_frames(audio, len(video_frames))
                     audio_frames = audio_frames[: len(video_frames)]
+                    video_frames = video_frames[: len(audio_frames)]
                     # Save each frame in output_folder
                     for i, video_frame in enumerate(video_frames):
                         # Save video frame
-
                         video_frame_path = os.path.join(
                             f"{self.output_data_dir}/video/{speaker}/{video_folder}/{video_file_name}",
                             f"{video_file.replace('.mp4', '')}_{i}.npy",
                         )
-                        np.save(video_frame_path, video_frame)
+                        np.save(video_frame_path, np.transpose(video_frame, (2, 0, 1)))
                         # Save audio frame
                         audio_frame_path = os.path.join(
                             f"{self.output_data_dir}/audio/{speaker}/{video_folder}/{video_file_name}",
@@ -142,7 +141,7 @@ class Preprocessor:
                         ) as f:
                             json.dump(data, f)
 
-    def get_audio_frames(self, audio: np.array):
+    def get_audio_frames(self, audio: np.array, n_video_frames:int):
         """
         Get audio frames from audio file
         """
@@ -154,15 +153,11 @@ class Preprocessor:
             self.audio_extractor_bundle.sample_rate,
         ).to(self.device)
         with torch.no_grad():
-            audio_features = (
-                self.audio_extractor(audio.unsqueeze(0).float())[0].detach().cpu()
-            )
+            audio_features = self.audio_extractor(audio.unsqueeze(0).float())
+        audio_features = audio_features[0].cpu().numpy().squeeze(0)            
         # Calculate number of chunks
-        n_chunks = (
-            audio.shape[0] / self.audio_extractor_bundle.sample_rate
-        ) * self.video_fps
         # Split array into chunks
-        audio_chunks = np.array_split(audio_features, n_chunks)
+        audio_chunks = np.array_split(audio_features, n_video_frames)
         return audio_chunks
 
 
@@ -171,7 +166,7 @@ class AudioVideoFrameDataset(Dataset):
         super().__init__()
         self.data_dir = data_dir
         self.datapoints = [
-            f"{data_dir}/{spk}/{d}/{vid}/{datapoint}"
+            f"{data_dir}/datapoints/{spk}/{d}/{vid}/{datapoint}"
             for spk in os.listdir(f"{data_dir}/datapoints/")
             for d in os.listdir(f"{data_dir}/datapoints/{spk}")
             for vid in os.listdir(f"{data_dir}/datapoints/{spk}/{d}")
@@ -191,20 +186,21 @@ class AudioVideoFrameDataset(Dataset):
         audio_frame = torch.from_numpy(np.load(data["audio_frame"]))
         video_frame = torch.from_numpy(np.load(data["video_frame"]))
         # Randomly select a frame from the video frames directory
-        root_path = "/".join(video_frame.split("/")[:-1])
-        id_frame = torch.from_numpy(np.load(random.choice(os.listdir(root_path))))
+        dir_path = "/".join(data["video_frame"].split("/")[:-1])
+        id_frame = f'{dir_path}/{random.choice(os.listdir(dir_path))}'
+        id_frame = torch.from_numpy(np.load(id_frame))
         # Get motion frames
         if data["motion_frame"]:
             motion_frames = [
-                torch.from_numpy(np.load(frame)) for frame in motion_frames
+                torch.from_numpy(np.load(frame)) for frame in data["motion_frame"]
             ]
         else:
             motion_frames = [id_frame, id_frame]
         # Apply transforms
         if self.frame_transforms:
-            video_frame = self.frame_transforms(video_frame)
-            id_frame = self.frame_transforms(id_frame)
-            motion_frames = [self.frame_transforms(frame) for frame in motion_frames]
+            video_frame = self.frame_transforms(video_frame/255)
+            id_frame = self.frame_transforms(id_frame/255)
+            motion_frames = [self.frame_transforms(frame/255) for frame in motion_frames]
 
         return {
             "target_frame": video_frame,  # noise is added to this frame
@@ -221,6 +217,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_dir",
         type=str,
+        default="/home/j/Desktop/Programming/DeepLearning/multilingual/avatar/data/vox",
+        help="Path to data directory",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
         default="./data/vox",
         help="Path to data directory",
     )
@@ -233,17 +235,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--video_fps",
         type=int,
-        default=30,
+        default=25,
         help="Video frames per second",
     )
     args = parser.parse_args()
 
-    if os.path.exists(f"{args.data_dir}/processed"):
-        action = input("Data already processed. Delete and re-run? (y/n): ").lower()
-        if action == "y":
-            shutil.rmtree(f"{args.data_dir}/processed")
-        else:
-            exit(0)
+    # if os.path.exists(f"{args.output_dir}/processed"):
+    #     action = input("Data already processed. Delete and re-run? (y/n): ").lower()
+    #     if action == "y":
+    shutil.rmtree(f"{args.output_dir}/processed")
+    #     else:
+    #         exit(0)
 
-    preprocessor = Preprocessor(args.data_dir, args.audio_sr, args.video_fps)
+    preprocessor = Preprocessor(args.data_dir,args.output_dir, args.audio_sr, args.video_fps)
     preprocessor.preprocess()
+
+
+    # dataset = AudioVideoFrameDataset('./data/vox/processed')
+
+    # for i in range(10):
+    #     outs = dataset[i]
+    #     print(outs['target_frame'].shape)
+    #     print(outs['audio_frame'][0].shape)
+    #     print(outs['motion_frames'][0].shape)
+    #     print(outs['id_frame'].shape)
+        

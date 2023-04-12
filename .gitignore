@@ -1,2 +1,4 @@
 data
 .vscode
+venv
+sd-model-finetuned
